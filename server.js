@@ -12,7 +12,8 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const CLIENT_URL = process.env.CLIENT_URL || "http://localhost:5173";
+const CLIENT_URL =
+  process.env.CLIENT_URL || "https://sitebase-platform.netlify.app";
 
 // Security headers
 app.use(helmet());
@@ -23,7 +24,7 @@ app.use(
     origin: CLIENT_URL.split(",").map((o) => o.trim()),
     methods: ["GET", "POST", "PUT", "DELETE"],
     allowedHeaders: ["Content-Type"],
-  })
+  }),
 );
 
 // Trust proxy when running behind reverse proxy (Render / Nginx)
@@ -74,9 +75,11 @@ const validateProject = ({ title, description, liveUrl, image }) => {
   if (!title || !title.trim()) return "Title is required";
   if (title.trim().length > 120) return "Title must be under 120 characters";
   if (!description || !description.trim()) return "Description is required";
-  if (description.trim().length > 2000) return "Description must be under 2000 characters";
+  if (description.trim().length > 2000)
+    return "Description must be under 2000 characters";
   if (!liveUrl || !liveUrl.trim()) return "Live URL is required";
-  if (!isValidHttpUrl(liveUrl.trim())) return "Live URL must be a valid http(s) link";
+  if (!isValidHttpUrl(liveUrl.trim()))
+    return "Live URL must be a valid http(s) link";
   if (image && image.trim() && !isValidHttpUrl(image.trim())) {
     return "Preview image must be a valid http(s) link";
   }
@@ -98,7 +101,13 @@ const isPublicHostname = (url) => {
   const ipv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
   if (ipv4) {
     const [a, b] = host.split(".").map(Number);
-    if (a === 127 || a === 10 || (a === 192 && b === 168) || (a === 169 && b === 254) || a === 0) {
+    if (
+      a === 127 ||
+      a === 10 ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      a === 0
+    ) {
       return false;
     }
   }
@@ -117,11 +126,15 @@ const fetchWithTimeout = async (url, options) => {
 
 const fetchFromMicrolink = async (url) => {
   const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&palette=false&video=false`;
-  const res = await fetchWithTimeout(api, { headers: { "User-Agent": BROWSER_UA } });
+  const res = await fetchWithTimeout(api, {
+    headers: { "User-Agent": BROWSER_UA },
+  });
   const json = await res.json();
   const shotUrl = json?.data?.screenshot?.url;
   if (!shotUrl) throw new Error("microlink returned no screenshot");
-  const img = await fetchWithTimeout(shotUrl, { headers: { "User-Agent": BROWSER_UA } });
+  const img = await fetchWithTimeout(shotUrl, {
+    headers: { "User-Agent": BROWSER_UA },
+  });
   if (!img.ok) throw new Error("microlink image download failed");
   return {
     type: img.headers.get("content-type")?.split(";")[0] || "image/png",
@@ -131,10 +144,13 @@ const fetchFromMicrolink = async (url) => {
 
 const fetchFromMshots = async (url) => {
   const api = `https://s0.wp.com/mshots/v1/${encodeURIComponent(url)}?w=640&h=420`;
-  const res = await fetchWithTimeout(api, { headers: { "User-Agent": BROWSER_UA } });
+  const res = await fetchWithTimeout(api, {
+    headers: { "User-Agent": BROWSER_UA },
+  });
   if (!res.ok) throw new Error("mshots request failed");
   const type = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
-  if (!type.startsWith("image/")) throw new Error("mshots did not return an image");
+  if (!type.startsWith("image/"))
+    throw new Error("mshots did not return an image");
   return {
     type,
     data: Buffer.from(await res.arrayBuffer()),
@@ -178,9 +194,12 @@ app.get("/api/screenshot", async (req, res) => {
   let target;
   try {
     target = new URL(raw);
-    if (!["http:", "https:"].includes(target.protocol)) throw new Error("bad protocol");
+    if (!["http:", "https:"].includes(target.protocol))
+      throw new Error("bad protocol");
     if (!isPublicHostname(target)) {
-      return res.status(400).json({ message: "URL must point to a public address" });
+      return res
+        .status(400)
+        .json({ message: "URL must point to a public address" });
     }
   } catch {
     return res.status(400).json({ message: "Invalid screenshot URL" });
@@ -286,18 +305,29 @@ app.use((err, req, res, next) => {
   if (res.headersSent) {
     return next(err);
   }
-  res.status(err.status || 500).json({ message: "Something went wrong on the server" });
+  res
+    .status(err.status || 500)
+    .json({ message: "Something went wrong on the server" });
 });
 
 // MongoDB connection listeners (prevent silent crashes on reconnect issues)
-mongoose.connection.on("error", (err) => console.error("❌ MongoDB error:", err.message));
-mongoose.connection.on("disconnected", () => console.warn("⚠️ MongoDB disconnected"));
+mongoose.connection.on("error", (err) =>
+  console.error("❌ MongoDB error:", err.message),
+);
+mongoose.connection.on("disconnected", () =>
+  console.warn("⚠️ MongoDB disconnected"),
+);
 
-const server = app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+const server = app.listen(PORT, () =>
+  console.log(`🚀 Server running on port ${PORT}`),
+);
 
 // Global crash guards — log instead of letting the process die
 process.on("unhandledRejection", (reason) => {
-  console.error("⚠️ Unhandled rejection:", reason instanceof Error ? reason.stack : reason);
+  console.error(
+    "⚠️ Unhandled rejection:",
+    reason instanceof Error ? reason.stack : reason,
+  );
 });
 process.on("uncaughtException", (err) => {
   console.error("⚠️ Uncaught exception:", err.stack || err);
