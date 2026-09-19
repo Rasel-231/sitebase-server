@@ -52,6 +52,13 @@ if (!MONGO_URI) {
   process.exit(1);
 }
 
+const ADMIN_ID = process.env.ADMIN_ID || "150231";
+
+const isAdminRequest = (req) => {
+  const provided = req.headers["x-admin-id"] || req.body?.adminId || req.query?.adminId;
+  return Boolean(provided && String(provided).trim() === ADMIN_ID);
+};
+
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB connected"))
@@ -221,6 +228,14 @@ app.get("/api/screenshot", async (req, res) => {
 
 // ---------- ROUTES ----------
 
+// Verify admin ID before allowing edits / deletes
+app.post("/api/admin/verify", (req, res) => {
+  if (isAdminRequest(req)) {
+    return res.status(200).json({ message: "Admin verified" });
+  }
+  return res.status(401).json({ message: "Invalid admin ID" });
+});
+
 // GET all projects
 app.get("/api/projects", async (req, res, next) => {
   try {
@@ -253,6 +268,9 @@ app.post("/api/projects", async (req, res, next) => {
 
 // PUT update project
 app.put("/api/projects/:id", async (req, res, next) => {
+  if (!isAdminRequest(req)) {
+    return res.status(401).json({ message: "Invalid admin ID" });
+  }
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid project ID" });
@@ -280,6 +298,9 @@ app.put("/api/projects/:id", async (req, res, next) => {
 
 // DELETE project
 app.delete("/api/projects/:id", async (req, res, next) => {
+  if (!isAdminRequest(req)) {
+    return res.status(401).json({ message: "Invalid admin ID" });
+  }
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid project ID" });
