@@ -1,174 +1,196 @@
+import crypto from "crypto";
 import express from "express";
-import mongoose from "mongoose";
 import cors from "cors";
 import helmet from "helmet";
-import rateLimit from "express-rate-limit";
+import mongoose from "mongoose";
 import mongoSanitize from "express-mongo-sanitize";
+import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import Project from "./models/Project.js";
 
 dotenv.config();
 
+/* ---------- Config ---------- */
+
+const {
+  MONGO_URI,
+  ADMIN_ID,
+  PORT = 5000,
+  CLIENT_URL = "https://sitebase-platform.netlify.app",
+  ALLOW_PUBLIC_ADD,
+} = process.env;
+
+for (const [name, value] of Object.entries({ MONGO_URI, ADMIN_ID })) {
+  if (!value) {
+    console.error(`Missing ${name} in environment variables`);
+    process.exit(1);
+  }
+}
+
+/* ---------- App setup ---------- */
+
 const app = express();
-const PORT = process.env.PORT || 5000;
+app.set("trust proxy", 1); // Render sits behind a proxy
 
-const CLIENT_URL =
-  process.env.CLIENT_URL || "https://sitebase-platform.netlify.app";
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
-// Security headers
-app.use(helmet());
-
-// CORS: allow only the frontend origin
 app.use(
   cors({
     origin: CLIENT_URL.split(",").map((o) => o.trim()),
-    methods: ["GET", "POST", "PUT", "DELETE"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "x-admin-id"],
   }),
 );
 
-// Trust proxy when running behind reverse proxy (Render / Nginx)
-app.set("trust proxy", 1);
-
-// Body parser with size limit
 app.use(express.json({ limit: "50kb" }));
-
-// Prevent NoSQL injection
 app.use(mongoSanitize());
 
-// Rate limiting
-const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 200,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { message: "Too many requests, please try again later." },
-});
-app.use("/api", apiLimiter);
-
-const { MONGO_URI } = process.env;
-if (!MONGO_URI) {
-  console.error("❌ MONGO_URI is missing in .env");
-  process.exit(1);
-}
-
-const ADMIN_ID = process.env.ADMIN_ID || "150231";
-
-const isAdminRequest = (req) => {
-  const provided =
-    req.headers["x-admin-id"] || req.body?.adminId || req.query?.adminId;
-  return Boolean(provided && String(provided).trim() === ADMIN_ID);
-};
-
-mongoose
-  .connect(MONGO_URI)
-  .then(() => console.log("✅ MongoDB connected"))
-  .catch((err) => {
-    console.error("❌ MongoDB connection error:", err.message);
-    process.exit(1);
+const createLimiter = (options) =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    standardHeaders: true,
+    legacyHeaders: false,
+    ...options,
   });
 
-// ---------- HELPERS ----------
+app.use(
+  "/api",
+  createLimiter({
+    max: 200,
+    message: { message: "Too many requests, please try again later." },
+  }),
+);
+
+// Counts only failed admin attempts (401)
+const adminLimiter = createLimiter({
+  max: 10,
+  skipSuccessfulRequests: true,
+  requestWasSuccessful: (req, res) => res.statusCode !== 401,
+  message: { message: "Too many failed attempts, please try again later." },
+});
+
+/* ---------- Helpers ---------- */
+
+const wrap = (fn) => (req, res, next) =>
+  Promise.resolve(fn(req, res, next)).catch(next);
+
+const safeEqual = (a, b) => {
+  const bufA = Buffer.from(String(a));
+  const bufB = Buffer.from(String(b));
+  return bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB);
+};
+
+const isAdminRequest = (req) => {
+  const provided = req.headers["x-admin-id"];
+  return Boolean(provided) && safeEqual(String(provided).trim(), ADMIN_ID);
+};
+
+const requireAdmin = (req, res, next) =>
+  isAdminRequest(req)
+    ? next()
+    : res.status(401).json({ message: "Invalid admin ID" });
+
+const adminOnly = [adminLimiter, requireAdmin];
+const addGuard = ALLOW_PUBLIC_ADD === "true" ? [] : adminOnly;
 
 const isValidHttpUrl = (value) => {
   try {
-    const url = new URL(value);
-    return url.protocol === "http:" || url.protocol === "https:";
+    const { protocol } = new URL(value);
+    return protocol === "http:" || protocol === "https:";
   } catch {
     return false;
   }
 };
 
+const pickProjectFields = (body = {}) => {
+  const text = (v) => (typeof v === "string" ? v.trim() : "");
+  return {
+    title: text(body.title),
+    description: text(body.description),
+    liveUrl: text(body.liveUrl),
+    image: text(body.image),
+  };
+};
+
 const validateProject = ({ title, description, liveUrl, image }) => {
-  if (!title || !title.trim()) return "Title is required";
-  if (title.trim().length > 120) return "Title must be under 120 characters";
-  if (!description || !description.trim()) return "Description is required";
-  if (description.trim().length > 2000)
+  if (!title) return "Title is required";
+  if (title.length > 120) return "Title must be under 120 characters";
+  if (!description) return "Description is required";
+  if (description.length > 2000)
     return "Description must be under 2000 characters";
-  if (!liveUrl || !liveUrl.trim()) return "Live URL is required";
-  if (!isValidHttpUrl(liveUrl.trim()))
-    return "Live URL must be a valid http(s) link";
-  if (image && image.trim() && !isValidHttpUrl(image.trim())) {
+  if (!liveUrl) return "Live URL is required";
+  if (!isValidHttpUrl(liveUrl)) return "Live URL must be a valid http(s) link";
+  if (image && !isValidHttpUrl(image))
     return "Preview image must be a valid http(s) link";
-  }
   return null;
 };
 
-// ---------- LIVE SCREENSHOT PROXY ----------
+/* ---------- Screenshot proxy ---------- */
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-const screenshotCache = new Map();
 const CACHE_MAX = 200;
+const screenshotCache = new Map();
 const inFlight = new Map();
 
-const isPublicHostname = (url) => {
-  const host = url.hostname.toLowerCase();
+const isPublicHostname = ({ hostname }) => {
+  const host = hostname.toLowerCase();
   if (host === "localhost" || host.endsWith(".local")) return false;
-  const ipv4 = /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
-  if (ipv4) {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
     const [a, b] = host.split(".").map(Number);
-    if (
-      a === 127 ||
+    const isPrivate =
+      a === 0 ||
       a === 10 ||
-      (a === 192 && b === 168) ||
+      a === 127 ||
       (a === 169 && b === 254) ||
-      a === 0
-    ) {
-      return false;
-    }
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168);
+    if (isPrivate) return false;
   }
   return true;
 };
 
-const fetchWithTimeout = async (url, options) => {
+const fetchWithTimeout = async (url, timeoutMs = 20000) => {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 20000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: ctrl.signal });
+    return await fetch(url, {
+      headers: { "User-Agent": BROWSER_UA },
+      signal: ctrl.signal,
+    });
   } finally {
     clearTimeout(timer);
   }
 };
 
-const fetchFromMicrolink = async (url) => {
+const toShot = async (res, fallbackType) => ({
+  type: res.headers.get("content-type")?.split(";")[0] || fallbackType,
+  data: Buffer.from(await res.arrayBuffer()),
+});
+
+const fromMicrolink = async (url) => {
   const api = `https://api.microlink.io/?url=${encodeURIComponent(url)}&screenshot=true&meta=false&palette=false&video=false`;
-  const res = await fetchWithTimeout(api, {
-    headers: { "User-Agent": BROWSER_UA },
-  });
-  const json = await res.json();
+  const json = await (await fetchWithTimeout(api)).json();
   const shotUrl = json?.data?.screenshot?.url;
   if (!shotUrl) throw new Error("microlink returned no screenshot");
-  const img = await fetchWithTimeout(shotUrl, {
-    headers: { "User-Agent": BROWSER_UA },
-  });
+  const img = await fetchWithTimeout(shotUrl);
   if (!img.ok) throw new Error("microlink image download failed");
-  return {
-    type: img.headers.get("content-type")?.split(";")[0] || "image/png",
-    data: Buffer.from(await img.arrayBuffer()),
-  };
+  return toShot(img, "image/png");
 };
 
-const fetchFromMshots = async (url) => {
-  const api = `https://s0.wp.com/mshots/v1/${encodeURIComponent(url)}?w=640&h=420`;
-  const res = await fetchWithTimeout(api, {
-    headers: { "User-Agent": BROWSER_UA },
-  });
+const fromMshots = async (url) => {
+  const res = await fetchWithTimeout(
+    `https://s0.wp.com/mshots/v1/${encodeURIComponent(url)}?w=640&h=420`,
+  );
   if (!res.ok) throw new Error("mshots request failed");
-  const type = res.headers.get("content-type")?.split(";")[0] || "image/jpeg";
-  if (!type.startsWith("image/"))
+  if (!res.headers.get("content-type")?.startsWith("image/"))
     throw new Error("mshots did not return an image");
-  return {
-    type,
-    data: Buffer.from(await res.arrayBuffer()),
-  };
+  return toShot(res, "image/jpeg");
 };
 
 const fetchScreenshot = async (url) => {
-  const sources = [fetchFromMicrolink, fetchFromMshots];
   let lastError = "no screenshot service available";
-  for (const source of sources) {
+  for (const source of [fromMicrolink, fromMshots]) {
     try {
       return await source(url);
     } catch (err) {
@@ -178,9 +200,10 @@ const fetchScreenshot = async (url) => {
   throw new Error(lastError);
 };
 
-const getScreenshot = async (key) => {
+const getScreenshot = (key) => {
   if (screenshotCache.has(key)) return screenshotCache.get(key);
   if (inFlight.has(key)) return inFlight.get(key);
+
   const promise = fetchScreenshot(key)
     .then((shot) => {
       screenshotCache.set(key, shot);
@@ -190,6 +213,7 @@ const getScreenshot = async (key) => {
       return shot;
     })
     .finally(() => inFlight.delete(key));
+
   inFlight.set(key, promise);
   return promise;
 };
@@ -199,165 +223,137 @@ app.get("/api/screenshot", async (req, res) => {
   if (!raw || typeof raw !== "string") {
     return res.status(400).json({ message: "url query parameter is required" });
   }
+
   let target;
   try {
     target = new URL(raw);
-    if (!["http:", "https:"].includes(target.protocol))
-      throw new Error("bad protocol");
-    if (!isPublicHostname(target)) {
-      return res
-        .status(400)
-        .json({ message: "URL must point to a public address" });
-    }
   } catch {
     return res.status(400).json({ message: "Invalid screenshot URL" });
   }
-
-  const key = target.toString();
+  if (!["http:", "https:"].includes(target.protocol)) {
+    return res.status(400).json({ message: "Invalid screenshot URL" });
+  }
+  if (!isPublicHostname(target)) {
+    return res
+      .status(400)
+      .json({ message: "URL must point to a public address" });
+  }
 
   try {
-    const shot = await getScreenshot(key);
-    if (res.headersSent) return;
+    const shot = await getScreenshot(target.toString());
     res.set("Content-Type", shot.type);
     res.set("Cache-Control", "public, max-age=86400");
     res.send(shot.data);
-  } catch (err) {
-    if (res.headersSent) return;
-    res.status(502).json({ message: "Could not generate screenshot" });
+  } catch {
+    if (!res.headersSent) {
+      res.status(502).json({ message: "Could not generate screenshot" });
+    }
   }
 });
 
-// ---------- ROUTES ----------
+/* ---------- Routes ---------- */
 
-// Verify admin ID before allowing edits / deletes
-app.post("/api/admin/verify", (req, res) => {
-  if (isAdminRequest(req)) {
-    return res.status(200).json({ message: "Admin verified" });
-  }
-  return res.status(401).json({ message: "Invalid admin ID" });
-});
+app.post("/api/admin/verify", ...adminOnly, (req, res) =>
+  res.status(200).json({ message: "Admin verified" }),
+);
 
-// GET all projects
-app.get("/api/projects", async (req, res, next) => {
-  try {
+app.get(
+  "/api/projects",
+  wrap(async (req, res) => {
     const projects = await Project.find().sort({ createdAt: -1 }).lean();
     res.status(200).json(projects);
-  } catch (err) {
-    next(err);
-  }
-});
+  }),
+);
 
-// POST new project
-app.post("/api/projects", async (req, res, next) => {
-  try {
-    const project = {
-      title: req.body.title || "",
-      description: req.body.description || "",
-      liveUrl: req.body.liveUrl || "",
-      image: req.body.image || "",
-    };
-    const validationError = validateProject(project);
-    if (validationError) {
-      return res.status(400).json({ message: validationError });
-    }
-    const newProject = await Project.create(project);
-    res.status(201).json(newProject);
-  } catch (err) {
-    next(err);
-  }
-});
+app.post(
+  "/api/projects",
+  ...addGuard,
+  wrap(async (req, res) => {
+    const project = pickProjectFields(req.body);
+    const error = validateProject(project);
+    if (error) return res.status(400).json({ message: error });
 
-// PUT update project
-app.put("/api/projects/:id", async (req, res, next) => {
-  if (!isAdminRequest(req)) {
-    return res.status(401).json({ message: "Invalid admin ID" });
-  }
-  try {
+    res.status(201).json(await Project.create(project));
+  }),
+);
+
+app.put(
+  "/api/projects/:id",
+  ...adminOnly,
+  wrap(async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid project ID" });
     }
-    const project = {
-      title: req.body.title || "",
-      description: req.body.description || "",
-      liveUrl: req.body.liveUrl || "",
-      image: req.body.image || "",
-    };
-    const validationError = validateProject(project);
-    if (validationError) {
-      return res.status(400).json({ message: validationError });
-    }
+    const project = pickProjectFields(req.body);
+    const error = validateProject(project);
+    if (error) return res.status(400).json({ message: error });
+
     const updated = await Project.findByIdAndUpdate(req.params.id, project, {
       new: true,
       runValidators: true,
     });
     if (!updated) return res.status(404).json({ message: "Project not found" });
     res.status(200).json(updated);
-  } catch (err) {
-    next(err);
-  }
-});
+  }),
+);
 
-// DELETE project
-app.delete("/api/projects/:id", async (req, res, next) => {
-  if (!isAdminRequest(req)) {
-    return res.status(401).json({ message: "Invalid admin ID" });
-  }
-  try {
+app.delete(
+  "/api/projects/:id",
+  ...adminOnly,
+  wrap(async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ message: "Invalid project ID" });
     }
     const deleted = await Project.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ message: "Project not found" });
     res.status(200).json({ message: "Project deleted successfully" });
-  } catch (err) {
-    next(err);
-  }
-});
+  }),
+);
 
-// ---------- FALLBACKS ----------
+/* ---------- Fallbacks ---------- */
 
-// 404 handler
-app.use((req, res) => {
-  res.status(404).json({ message: "Route not found" });
-});
+app.use((req, res) => res.status(404).json({ message: "Route not found" }));
 
-// Central error handler
 app.use((err, req, res, next) => {
-  console.error("❌", err.message);
-  if (res.headersSent) {
-    return next(err);
-  }
+  console.error("Error:", err.message);
+  if (res.headersSent) return next(err);
   res
     .status(err.status || 500)
     .json({ message: "Something went wrong on the server" });
 });
 
-// MongoDB connection listeners (prevent silent crashes on reconnect issues)
+/* ---------- Startup & shutdown ---------- */
+
 mongoose.connection.on("error", (err) =>
-  console.error("❌ MongoDB error:", err.message),
+  console.error("MongoDB error:", err.message),
 );
 mongoose.connection.on("disconnected", () =>
-  console.warn("⚠️ MongoDB disconnected"),
+  console.warn("MongoDB disconnected"),
 );
+
+mongoose
+  .connect(MONGO_URI)
+  .then(() => console.log("MongoDB connected"))
+  .catch((err) => {
+    console.error("MongoDB connection error:", err.message);
+    process.exit(1);
+  });
 
 const server = app.listen(PORT, () =>
-  console.log(`🚀 Server running on port ${PORT}`),
+  console.log(`Server running on port ${PORT}`),
 );
 
-// Global crash guards — log instead of letting the process die
-process.on("unhandledRejection", (reason) => {
+process.on("unhandledRejection", (reason) =>
   console.error(
-    "⚠️ Unhandled rejection:",
+    "Unhandled rejection:",
     reason instanceof Error ? reason.stack : reason,
-  );
-});
-process.on("uncaughtException", (err) => {
-  console.error("⚠️ Uncaught exception:", err.stack || err);
-});
+  ),
+);
+process.on("uncaughtException", (err) =>
+  console.error("Uncaught exception:", err.stack || err),
+);
 
-// Graceful shutdown
 const shutdown = () => {
-  console.log("Shutting down gracefully...");
   const forceExit = setTimeout(() => process.exit(1), 5000);
   forceExit.unref();
   server.close(() => {
