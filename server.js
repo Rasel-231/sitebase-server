@@ -251,8 +251,6 @@ app.get("/api/screenshot", async (req, res) => {
   }
 });
 
-/* ---------- Routes ---------- */
-
 app.post("/api/admin/verify", ...adminOnly, (req, res) =>
   res.status(200).json({ message: "Admin verified" }),
 );
