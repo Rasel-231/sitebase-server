@@ -315,8 +315,16 @@ app.delete(
 app.use((req, res) => res.status(404).json({ message: "Route not found" }));
 
 app.use((err, req, res, next) => {
-  console.error("Error:", err.message);
+  console.error("Error:", err);
   if (res.headersSent) return next(err);
+
+  if (err.type === "entity.parse.failed") {
+    return res.status(400).json({ message: "Invalid JSON in request body" });
+  }
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ message: "Request body too large" });
+  }
+
   res
     .status(err.status || 500)
     .json({ message: "Something went wrong on the server" });
