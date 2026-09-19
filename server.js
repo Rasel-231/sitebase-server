@@ -23,7 +23,7 @@ app.use(
   cors({
     origin: CLIENT_URL.split(",").map((o) => o.trim()),
     methods: ["GET", "POST", "PUT", "DELETE"],
-    allowedHeaders: ["Content-Type"],
+    allowedHeaders: ["Content-Type", "x-admin-id"],
   }),
 );
 
@@ -55,7 +55,8 @@ if (!MONGO_URI) {
 const ADMIN_ID = process.env.ADMIN_ID || "150231";
 
 const isAdminRequest = (req) => {
-  const provided = req.headers["x-admin-id"] || req.body?.adminId || req.query?.adminId;
+  const provided =
+    req.headers["x-admin-id"] || req.body?.adminId || req.query?.adminId;
   return Boolean(provided && String(provided).trim() === ADMIN_ID);
 };
 
